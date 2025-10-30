@@ -1,24 +1,95 @@
-# This is a standard Dockerfile for building a Go app.
-# It is a multi-stage build: the first stage compiles the Go source into a binary, and
-#   the second stage copies only the binary into an alpine base.
+# Build stage
+FROM python:3.12-slim-bookworm AS builder
 
-# -- Stage 1 -- #
-# Compile the app.
-FROM golang:1.22-alpine as builder
+# Install uv using the official method
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+# Install system dependencies required for building certain Python packages
+# Add Node.js 20.x LTS for building frontend
+RUN apt-get update && apt-get upgrade -y && apt-get install -y \
+    gcc g++ git make \
+    curl \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set build optimization environment variables
+ENV MAKEFLAGS="-j$(nproc)"
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV UV_COMPILE_BYTECODE=1
+ENV UV_LINK_MODE=copy
+
+# Set the working directory in the container to /app
 WORKDIR /app
-# The build context is set to the directory where the repo is cloned.
-# This will copy all files in the repo to /app inside the container.
-# If your app requires the build context to be set to a subdirectory inside the repo, you
-#   can use the source_dir app spec option, see: https://www.digitalocean.com/docs/app-platform/references/app-specification-reference/
-COPY . .
-RUN go build -mod=vendor -o bin/hello
 
-# -- Stage 2 -- #
-# Create the final environment with the compiled binary.
-FROM alpine:3.20
-# Install any required dependencies.
-RUN apk --no-cache add ca-certificates
-WORKDIR /root/
-# Copy the binary from the builder stage and set it as the default command.
-COPY --from=builder /app/bin/hello /usr/local/bin/
-CMD ["hello"]
+# Copy dependency files and minimal package structure first for better layer caching
+COPY pyproject.toml uv.lock ./
+COPY open_notebook/__init__.py ./open_notebook/__init__.py
+
+# Install dependencies with optimizations (this layer will be cached unless dependencies change)
+RUN uv sync --frozen --no-dev
+
+# Copy the rest of the application code
+COPY . /app
+
+# Install frontend dependencies and build
+WORKDIR /app/frontend
+RUN npm ci
+RUN npm run build
+
+# Return to app root
+WORKDIR /app
+
+# Runtime stage
+FROM python:3.12-slim-bookworm AS runtime
+
+# Install only runtime system dependencies (no build tools)
+# Add Node.js 20.x LTS for running frontend
+RUN apt-get update && apt-get upgrade -y && apt-get install -y \
+    ffmpeg \
+    supervisor \
+    curl \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv using the official method
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+# Set the working directory in the container to /app
+WORKDIR /app
+
+# Copy the virtual environment from builder stage
+COPY --from=builder /app/.venv /app/.venv
+
+# Copy the application code
+COPY --from=builder /app /app
+
+# Copy built frontend from builder stage
+COPY --from=builder /app/frontend/.next/standalone /app/frontend/
+COPY --from=builder /app/frontend/.next/static /app/frontend/.next/static
+COPY --from=builder /app/frontend/public /app/frontend/public
+
+# Expose ports for Frontend and API
+EXPOSE 8502 5055
+
+RUN mkdir -p /app/data
+
+# Copy supervisord configuration
+COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+
+# Create log directories
+RUN mkdir -p /var/log/supervisor
+
+# Runtime API URL Configuration
+# The API_URL environment variable can be set at container runtime to configure
+# where the frontend should connect to the API. This allows the same Docker image
+# to work in different deployment scenarios without rebuilding.
+#
+# If not set, the system will auto-detect based on incoming requests.
+# Set API_URL when using reverse proxies or custom domains.
+#
+# Example: docker run -e API_URL=https://your-domain.com/api ...
+
+CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
